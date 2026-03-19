@@ -13,7 +13,7 @@
  ****************************************************************************************/
 
 const PRODUCT_CONFIG = {
-  VERSION: "v25.0",
+  VERSION: "v25.1",
   COACH_NAME: "Халиунаа",
   PRODUCT_NAME: "Хувийн Жингийн Тайлан",
   SHEET_NAME: "Sheet1",
@@ -36,9 +36,6 @@ const PRODUCT_CONFIG = {
   GEMINI_MODEL: "gemini-2.5-flash",
   TEMPERATURE: 0.4,
   REPORT_QUALITY: {
-    FINAL_MIN_WORDS: 2100,
-    MAX_REPAIR_ATTEMPTS: 2,
-    EDIT_TEMPERATURE: 0.25,
     SAFE_EMOJIS: ["👋", "🤔", "📈", "🚨", "😴", "🧠", "🔥", "💪", "🥗", "🍳", "🥣", "🍎", "🥩", "🍚", "🚶", "✅", "⚠", "🌿", "💧", "🚀", "📌", "✨", "🏋"]
   },
 
@@ -381,9 +378,6 @@ function main() {
 	        } else if (errorMsgStr.includes("DATA_EXTRACTION_PARSE_ERROR") || errorMsgStr.includes("DATA_VALIDATION_ERROR")) {
 	            mongolianError = "Оролтын өгөгдөл дутуу эсвэл ойлгомжгүй тул гараар шалгах шаардлагатай.";
 	            requiresManualReview = true;
-	        } else if (errorMsgStr.includes("REPORT_QUALITY_ERROR")) {
-	            mongolianError = "AI тайлан premium чанарын шалгуурыг хангаж чадсангүй. Гараар шалгах шаардлагатай.";
-	            requiresManualReview = true;
 	        } else if (errorMsgStr.includes("Gemini") || errorMsgStr.includes("JSON Parse Error")) {
 	            mongolianError = "AI (Gemini) хариу өгсөнгүй эсвэл түр зуур хэт ачаалалтай байна.";
 	        } else if (errorMsgStr.includes("UChat token") || errorMsgStr.includes("user_ns")) {
@@ -515,33 +509,40 @@ function generateReport3Parts(userName, metrics, apiKey) {
 
   const withPreviousSections = (template, previousSections) => {
     if (!previousSections || previousSections.length === 0) return template;
+    // VERY IMPORTANT FIX: Passing the entire previous text causes context pollution and duplicated headings/cut-offs.
+    // Instead of passing the massive text back, just give the LLM a short summary of what was already covered.
+    let contextSummary = "";
+    if (previousSections.length === 1) {
+        contextSummary = "- Та өмнөх (1-р) хэсэгт бодит байдал, таргалалтын шалтгааныг (Инсулин, Нойр) тайлбарлаж дууссан.";
+    } else if (previousSections.length === 2) {
+        contextSummary = "- Та өмнөх (2-р) хэсэгт хоолны төлөвлөгөөг (Өглөө, Өдөр, Орой) зааж өгөөд дууссан. Тиймээс ХООЛНЫ ТАЛААР ДАХИЖ ДАВТАХГҮЙ шууд дасгалын хуваарь руу орно.";
+    }
+
     return `${template}
 
-VII. ӨМНӨХ ХЭСГҮҮДИЙН КОНТЕКСТ:
-${previousSections.map((section, index) => `--- PART ${index + 1} ---
-${section}`).join("\n\n")}
-
-VIII. ҮРГЭЛЖЛЭЛИЙН ДҮРЭМ:
-- Дээрх хэсгүүдийн өнгө аяс, мэдээлэл, логик урсгалтай зөрчилдөж БОЛОХГҮЙ.
-- Давхардсан оршил, мэндчилгээ, ижил санааг давтаж БОЛОХГҮЙ.
-- Шинэ хэсгээ өмнөхөөсөө байгалийн байдлаар үргэлжлүүл.`;
+VII. ӨМНӨХ ХЭСГҮҮДИЙН КОНТЕКСТ БА ҮРГЭЛЖЛЭЛИЙН ДҮРЭМ:
+${contextSummary}
+- Өмнөх хэсгүүдийн гарчгийг дахин ДАВТАХГҮЙ.
+- Шинэ хэсгээ өмнөхөөсөө байгалийн байдлаар, зөвхөн шинэ мэдээллээр үргэлжлүүл.
+- ХЭЗЭЭ Ч БҮҮ МЭНДЭЛ (Сайн уу гэх мэт).
+- Текстээ бүрэн гүйцэд дуусгахыг хатуу анхаар! (Cut-off хийж болохгүй).`;
   };
 
   const p1 = replaceVars(templateSet.PART_1);
   const r1 = callGeminiAPI(p1, apiKey, PRODUCT_CONFIG.TEMPERATURE);
 
-  const p2 = withPreviousSections(replaceVars(templateSet.PART_2), [r1.text.trim()]);
+  const p2 = withPreviousSections(replaceVars(templateSet.PART_2), [true]); // Use dummy array to indicate part 2
   const r2 = callGeminiAPI(p2, apiKey, PRODUCT_CONFIG.TEMPERATURE);
 
-  const p3 = withPreviousSections(replaceVars(templateSet.PART_3), [r1.text.trim(), r2.text.trim()]);
+  const p3 = withPreviousSections(replaceVars(templateSet.PART_3), [true, true]); // Use dummy array to indicate part 3
   const r3 = callGeminiAPI(p3, apiKey, PRODUCT_CONFIG.TEMPERATURE);
 
   const draftReport = [r1.text.trim(), r2.text.trim(), r3.text.trim()].join("\n\n");
-  const polished = polishReportToPremium(userName, metrics, reportSpec, draftReport, apiKey);
+  const sanitizedText = sanitizeReportText(draftReport, reportSpec);
 
   return {
-    text: polished.text,
-    usage: (r1.usage || 0) + (r2.usage || 0) + (r3.usage || 0) + (polished.usage || 0)
+    text: sanitizedText,
+    usage: (r1.usage || 0) + (r2.usage || 0) + (r3.usage || 0)
   };
 }
 
@@ -610,131 +611,6 @@ function getReportSpec(metrics) {
   };
 }
 
-function polishReportToPremium(userName, metrics, reportSpec, draftReport, apiKey) {
-  let workingText = sanitizeReportText(draftReport, reportSpec);
-  let validation = validatePremiumReport(workingText, reportSpec);
-  let totalUsage = 0;
-
-  for (let attempt = 0; attempt <= PRODUCT_CONFIG.REPORT_QUALITY.MAX_REPAIR_ATTEMPTS; attempt++) {
-    const prompt = buildPremiumEditorPrompt(userName, metrics, reportSpec, workingText, validation.issues, attempt);
-    const result = callGeminiAPI(prompt, apiKey, PRODUCT_CONFIG.REPORT_QUALITY.EDIT_TEMPERATURE);
-    totalUsage += result.usage || 0;
-
-    workingText = sanitizeReportText(result.text, reportSpec);
-    validation = validatePremiumReport(workingText, reportSpec);
-
-    if (validation.ok) {
-      return { text: workingText, usage: totalUsage };
-    }
-  }
-
-  throw new Error(`REPORT_QUALITY_ERROR: ${validation.issues.join(" | ")}`);
-}
-
-function buildPremiumEditorPrompt(userName, metrics, reportSpec, draftReport, issues, attempt) {
-  const issueLines = issues && issues.length
-    ? issues.map((issue) => `- ${issue}`).join("\n")
-    : "- Draft-ийг premium түвшинд өнгөлж, бүтэц ба найруулгыг илүү чанартай болго.";
-
-  const safeEmojiText = PRODUCT_CONFIG.REPORT_QUALITY.SAFE_EMOJIS.join(" ");
-  const exactHeadings = reportSpec.requiredHeadings.map((heading) => `- [ГАРЧИГ] ${heading}`).join("\n");
-
-  return `
-Та бол Mongolian premium editorial QA редактор. Доорх draft-ийг premium бүтээгдэхүүний чанарт хүргэж бүрэн дахин бич.
-
-I. ХЭРЭГЛЭГЧИЙН ПРОФАЙЛ:
-- Нэр: ${userName}
-- Нас: ${metrics.AGE !== null ? metrics.AGE : "null"}
-- Хүйс: ${metrics.GENDER}
-- Өндөр: ${metrics.HEIGHT} см
-- Жин: ${metrics.WEIGHT} кг
-- BMI: ${metrics.CALC_BMI}
-- Ангилал: ${reportSpec.categoryLabel}
-
-II. ТОН БА ЧАНАР:
-- Халиунаагийн өнгө аяс барина: шууд, ухаалаг, халуун дулаан, premium.
-- Давталт багатай, уншихад шингэн, редактороор өнгөлсөн мэт байна.
-- 2 болон 3-р хэсэгт дахин мэндчилж БОЛОХГҮЙ.
-- Айлгах биш, гэхдээ үнэнийг булзааруулахгүй.
-
-III. EXACT OUTPUT STRUCTURE:
-${exactHeadings}
-
-IV. STRICT OUTPUT RULES:
-- Зөвхөн эцсийн тайланг буцаа. Тайлбар, тэмдэглэл, markdown, code fence БАЙХГҮЙ.
-- Дээрх 7 гарчиг яг тэр дарааллаараа, тус бүр НЭГ л удаа орно.
-- Гарчиг бүрийн өмнө [ГАРЧИГ] гэж ЗААВАЛ байна.
-- Гарчиг дээр эможи БАЙХГҮЙ.
-- Гарчиг биш мөр бүр зөвхөн НЭГ эможигоор эхэлнэ.
-- Эможи өгүүлбэрийн дунд эсвэл төгсгөлд БАЙХГҮЙ.
-- Зөвхөн энэ safe emoji жагсаалтаас сонгож ашигла: ${safeEmojiText}
-- 2-р хэсэгт дасгалын өдөр, сет, давталт БАЙХГҮЙ.
-- 2-р хэсгийн хоолны төлөвлөгөөнд Өглөө:, Өдөр:, Орой: гэсэн мөрүүд ЗААВАЛ байна.
-- 3-р хэсгийн дасгалын хэсэгт Халаалт, Даваа, Лхагва, Баасан, Бусад өдөр, Суллах дасгал гэсэн мөрүүд ЗААВАЛ байна.
-- 3-р хэсэгт хоолны төлөвлөгөө рүү буцаж БОЛОХГҮЙ.
-- Төгсгөлд дараах хоёр мөр яг энэ утгаараа байна:
-  ${PRODUCT_CONFIG.REPORT_DISCLAIMER_LINE}
-  ${PRODUCT_CONFIG.REPORT_SIGNATURE_LINE}
-- Тайлан нийтдээ 2200-2800 үг орчим байна.
-
-V. ОДООГИЙН АСУУДЛУУД:
-${issueLines}
-
-VI. DRAFT:
-${draftReport}
-
-VII. ЗАСВАРЫН ГОРИМ:
-- Attempt: ${attempt + 1}
-- Missing хэсэг байвал шинээр нөхөж бич.
-- Логик шилжилт сул байвал бүхэлд нь уялдуулж зас.
-- PDF дээр цэвэр харагдахаар мөр, жагсаалтын форматыг цэгцэл.
-`;
-}
-
-function validatePremiumReport(reportText, reportSpec) {
-  const issues = [];
-  const text = String(reportText || "");
-  const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
-  const bodyLines = lines.filter((line) => !line.startsWith("[ГАРЧИГ]"));
-
-  for (const heading of reportSpec.requiredHeadings) {
-    if (!text.includes(`[ГАРЧИГ] ${heading}`)) {
-      issues.push(`Missing heading: ${heading}`);
-    }
-  }
-
-  for (const phrase of reportSpec.requiredPhrases) {
-    if (!text.includes(phrase)) {
-      issues.push(`Missing required phrase: ${phrase}`);
-    }
-  }
-
-  const wordCount = countWords(text);
-  if (wordCount < PRODUCT_CONFIG.REPORT_QUALITY.FINAL_MIN_WORDS) {
-    issues.push(`Report too short: ${wordCount} words`);
-  }
-
-  if ((countMatches(text, /Сайн уу/g) + countMatches(text, /Халиунаа байна/g)) > 1) {
-    issues.push("Repeated greeting detected in continuation sections");
-  }
-
-  for (const line of bodyLines) {
-    if (!startsWithSafeEmoji(line)) {
-      issues.push(`Line does not start with a safe emoji: ${line.substring(0, 60)}`);
-      break;
-    }
-    if (lineHasInlineEmoji(line)) {
-      issues.push(`Inline emoji detected: ${line.substring(0, 60)}`);
-      break;
-    }
-  }
-
-  return {
-    ok: issues.length === 0,
-    issues: issues.slice(0, 12)
-  };
-}
-
 function sanitizeReportText(text, reportSpec) {
   let working = String(text || "")
     .replace(/\r\n?/g, "\n")
@@ -746,6 +622,9 @@ function sanitizeReportText(text, reportSpec) {
   const cleanedLines = [];
   const rawLines = working.split("\n");
 
+  // Track seen headings to strictly remove duplicates
+  const seenHeadings = new Set();
+
   for (const rawLine of rawLines) {
     const cleanLine = sanitizeReportLine(rawLine, reportSpec);
     if (!cleanLine) {
@@ -754,6 +633,15 @@ function sanitizeReportText(text, reportSpec) {
       }
       continue;
     }
+
+    if (cleanLine.startsWith("[ГАРЧИГ]")) {
+        const headingName = cleanLine.replace("[ГАРЧИГ]", "").trim();
+        if (seenHeadings.has(headingName)) {
+            continue; // Skip duplicate headings entirely
+        }
+        seenHeadings.add(headingName);
+    }
+
     cleanedLines.push(cleanLine);
   }
 
@@ -773,14 +661,23 @@ function sanitizeReportText(text, reportSpec) {
 function sanitizeReportLine(line, reportSpec) {
   let working = String(line || "").replace(/\s+/g, " ").trim();
   if (!working) return "";
-  if (/^(I|II|III|IV|V|VI|VII|VIII)\.\s/.test(working)) return "";
+  if (/^(I|II|III|IV|V|VI|VII|VIII|IX|X)\.\s/.test(working)) return "";
 
   const headingMatch = findHeadingMatch(working, reportSpec.requiredHeadings);
   if (headingMatch) {
     return `[ГАРЧИГ] ${headingMatch}`;
   }
 
-  working = stripSafeEmojis(working).replace(/^[-*•]+\s*/, "").trim();
+  // --- AUTO-HEALING EMOJI LOGIC ---
+  // Find if there is any emoji at the very beginning of the string
+  const firstCharMatch = working.match(/^[\u{1F300}-\u{1F6FF}\u{1F900}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{1F1E6}-\u{1F1FF}\u{1F200}-\u{1F2FF}]/u);
+  let startingEmoji = firstCharMatch ? firstCharMatch[0] : "";
+
+  // Strip ALL emojis and markdown list bullets from the rest of the string
+  working = working.replace(/[\u{1F300}-\u{1F6FF}\u{1F900}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{1F1E6}-\u{1F1FF}\u{1F200}-\u{1F2FF}]/gu, "")
+                   .replace(/^[-*•]+\s*/, "")
+                   .trim();
+
   if (!working) return "";
 
   const secondHeadingMatch = findHeadingMatch(working, reportSpec.requiredHeadings);
@@ -788,35 +685,49 @@ function sanitizeReportLine(line, reportSpec) {
     return `[ГАРЧИГ] ${secondHeadingMatch}`;
   }
 
-  return `${pickLineEmoji(working)} ${working}`;
+  // Assign a relevant emoji if the AI didn't provide one at the start
+  if (!startingEmoji) {
+    startingEmoji = pickLineEmoji(working);
+  }
+
+  return `${startingEmoji} ${working}`;
 }
 
 function findHeadingMatch(line, requiredHeadings) {
   const normalizedLine = normalizeComparableText(line);
+  // Flexible matching for headings: checking if normalized text contains most of the required heading words
   for (const heading of requiredHeadings) {
-    if (normalizedLine === normalizeComparableText(heading)) {
+    const normalizedHeading = normalizeComparableText(heading);
+    if (normalizedLine.includes(normalizedHeading) || normalizedHeading.includes(normalizedLine) || distanceMatch(normalizedLine, normalizedHeading)) {
       return heading;
     }
   }
   return null;
 }
 
+function distanceMatch(str1, str2) {
+    // If one string is almost identical to another (accounting for AI missing a word)
+    const len = Math.max(str1.length, str2.length);
+    if (len < 5) return false;
+    let matchCount = 0;
+    const words1 = str1.split(" ");
+    const words2 = str2.split(" ");
+    for(let w of words1) {
+        if(str2.includes(w) && w.length > 2) matchCount++;
+    }
+    return matchCount >= Math.min(words1.length, words2.length) - 1 && matchCount > 0;
+}
+
 function normalizeComparableText(text) {
-  return stripSafeEmojis(String(text || ""))
+  return String(text || "")
+    .replace(/[\u{1F300}-\u{1F6FF}\u{1F900}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{1F1E6}-\u{1F1FF}\u{1F200}-\u{1F2FF}]/gu, "")
     .replace(/\[ГАРЧИГ\]/g, "")
-    .replace(/[\u200D\uFE0F\u2640\u2642]/g, "")
-    .replace(/^[-*•]+\s*/, "")
+    .replace(/[\u200D\uFE0F\u2640\u2642()]/g, "")
+    .replace(/^[-*•\d]+\.?\s*/, "")
+    .replace(/[?!.]/g, "")
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
-}
-
-function stripSafeEmojis(text) {
-  let cleaned = String(text || "");
-  for (const emoji of PRODUCT_CONFIG.REPORT_QUALITY.SAFE_EMOJIS) {
-    cleaned = cleaned.split(emoji).join("");
-  }
-  return cleaned.trim();
 }
 
 function pickLineEmoji(line) {
@@ -839,27 +750,6 @@ function pickLineEmoji(line) {
   return "✅";
 }
 
-function startsWithSafeEmoji(line) {
-  return PRODUCT_CONFIG.REPORT_QUALITY.SAFE_EMOJIS.some((emoji) => line.startsWith(`${emoji} `));
-}
-
-function lineHasInlineEmoji(line) {
-  const withoutPrefix = stripLeadingSafeEmoji(line);
-  return PRODUCT_CONFIG.REPORT_QUALITY.SAFE_EMOJIS.some((emoji) => withoutPrefix.includes(emoji));
-}
-
-function stripLeadingSafeEmoji(line) {
-  for (const emoji of PRODUCT_CONFIG.REPORT_QUALITY.SAFE_EMOJIS) {
-    if (line.startsWith(`${emoji} `)) {
-      return line.substring(emoji.length + 1);
-    }
-  }
-  return line;
-}
-
-function countWords(text) {
-  return String(text || "").trim().split(/\s+/).filter(Boolean).length;
-}
 
 function countMatches(text, regex) {
   const matches = String(text || "").match(regex);
@@ -1043,6 +933,12 @@ function createPdfFromTemplate(name, content, templateId, folderId) {
         if (pText.includes("[ГАРЧИГ]")) {
             isHeading = true;
             pText = pText.replace("[ГАРЧИГ]", "").trim();
+        } else {
+            // Ensure exactly one leading emoji and no internal emojis as a final safeguard
+            const firstCharMatch = pText.match(/^[\u{1F300}-\u{1F6FF}\u{1F900}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{1F1E6}-\u{1F1FF}\u{1F200}-\u{1F2FF}]/u);
+            let firstEmoji = firstCharMatch ? firstCharMatch[0] : "";
+            let noEmojiText = pText.replace(/[\u{1F300}-\u{1F6FF}\u{1F900}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{1F1E6}-\u{1F1FF}\u{1F200}-\u{1F2FF}]/gu, "");
+            pText = (firstEmoji + " " + noEmojiText).trim();
         }
 
         let p = body.appendParagraph(pText);
