@@ -390,6 +390,8 @@ function main() {
 	        } else if (errorMsgStr.includes("DATA_EXTRACTION_PARSE_ERROR") || errorMsgStr.includes("DATA_VALIDATION_ERROR")) {
 	            mongolianError = "Оролтын өгөгдөл дутуу эсвэл ойлгомжгүй тул гараар шалгах шаардлагатай.";
 	            requiresManualReview = true;
+	        } else if (errorMsgStr.includes("REPORT_STRUCTURE_ERROR")) {
+	            mongolianError = "Тайлангийн бүтэц эвдэрсэн эсвэл гарчиг дутуу гарсан тул дахин оролдож байна.";
 	        } else if (errorMsgStr.includes("Gemini") || errorMsgStr.includes("JSON Parse Error")) {
 	            mongolianError = "AI (Gemini) хариу өгсөнгүй эсвэл түр зуур хэт ачаалалтай байна.";
 	        } else if (errorMsgStr.includes("UChat token") || errorMsgStr.includes("user_ns")) {
@@ -599,7 +601,7 @@ function getReportSpec(metrics) {
     };
   }
 
-  if (metrics.BMI_CATEGORY === "хэвийн жин" || metrics.BMI_CATEGORY === "илүүдэл жин") {
+  if (metrics.BMI_CATEGORY === "хэвийн жин") {
     return {
       templateSet: PRODUCT_CONFIG.PROMPTS.FITNESS_NORMAL,
       requiredHeadings: [
@@ -612,7 +614,7 @@ function getReportSpec(metrics) {
         "Эцсийн үг (Одоо чиний ээлж)"
       ],
       requiredPhrases: sharedPhrases,
-      categoryLabel: metrics.BMI_CATEGORY === "илүүдэл жин" ? "Илүүдэл жингийн тайлан (Хөнгөн анхааруулга)" : "Хэвийн жингийн тайлан"
+      categoryLabel: "Хэвийн жингийн тайлан"
     };
   }
 
@@ -628,7 +630,7 @@ function getReportSpec(metrics) {
       "Эцсийн үг (Одоо чиний ээлж)"
     ],
     requiredPhrases: sharedPhrases,
-    categoryLabel: "Таргалалттай тайлан"
+    categoryLabel: metrics.BMI_CATEGORY === "илүүдэл жин" ? "Илүүдэл жингийн тайлан (Анхааруулах шат)" : "Таргалалттай тайлан"
   };
 }
 
@@ -667,6 +669,26 @@ function sanitizeReportText(text, reportSpec) {
   }
 
   working = cleanedLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+
+  // STRICT VALIDATION: Ensure all required headings are present and in the EXACT order
+  let lastHeadingIndex = -1;
+  let foundHeadingsCount = 0;
+
+  for (const requiredHeading of reportSpec.requiredHeadings) {
+      const currentHeadingIndex = working.indexOf(`[ГАРЧИГ] ${requiredHeading}`);
+      if (currentHeadingIndex === -1) {
+          throw new Error(`REPORT_STRUCTURE_ERROR: Missing required heading: ${requiredHeading}`);
+      }
+      if (currentHeadingIndex < lastHeadingIndex) {
+          throw new Error(`REPORT_STRUCTURE_ERROR: Headings are out of order. '${requiredHeading}' appeared before its proper place.`);
+      }
+      lastHeadingIndex = currentHeadingIndex;
+      foundHeadingsCount++;
+  }
+
+  if (foundHeadingsCount !== reportSpec.requiredHeadings.length) {
+      throw new Error(`REPORT_STRUCTURE_ERROR: Incorrect number of headings found.`);
+  }
 
   if (!working.includes(PRODUCT_CONFIG.REPORT_DISCLAIMER_LINE)) {
     working += `\n⚠ ${PRODUCT_CONFIG.REPORT_DISCLAIMER_LINE}`;
@@ -716,27 +738,24 @@ function sanitizeReportLine(line, reportSpec) {
 
 function findHeadingMatch(line, requiredHeadings) {
   const normalizedLine = normalizeComparableText(line);
-  // Flexible matching for headings: checking if normalized text contains most of the required heading words
+
+  // STRICT matching for headings to prevent false positives from normal sentences.
+  // The line must almost exactly match the heading.
   for (const heading of requiredHeadings) {
     const normalizedHeading = normalizeComparableText(heading);
-    if (normalizedLine.includes(normalizedHeading) || normalizedHeading.includes(normalizedLine) || distanceMatch(normalizedLine, normalizedHeading)) {
-      return heading;
+
+    // Direct exact match
+    if (normalizedLine === normalizedHeading) {
+        return heading;
+    }
+
+    // Allow slight variations (e.g., if AI misses a single short word or adds an extra space),
+    // but the line cannot be a long paragraph containing the heading.
+    if (normalizedLine.includes(normalizedHeading) && normalizedLine.length <= normalizedHeading.length + 10) {
+        return heading;
     }
   }
   return null;
-}
-
-function distanceMatch(str1, str2) {
-    // If one string is almost identical to another (accounting for AI missing a word)
-    const len = Math.max(str1.length, str2.length);
-    if (len < 5) return false;
-    let matchCount = 0;
-    const words1 = str1.split(" ");
-    const words2 = str2.split(" ");
-    for(let w of words1) {
-        if(str2.includes(w) && w.length > 2) matchCount++;
-    }
-    return matchCount >= Math.min(words1.length, words2.length) - 1 && matchCount > 0;
 }
 
 function normalizeComparableText(text) {
@@ -804,11 +823,8 @@ function callGeminiAPI(prompt, apiKey, temp, requireJson = false) {
       const candidate = json.candidates[0];
       const finishReason = candidate.finishReason || "";
 
-      if (finishReason === "MAX_TOKENS") {
-          throw new Error("Gemini API Error: MAX_TOKENS reached. The generated text was cut off.");
-      }
       if (finishReason !== "STOP" && finishReason !== "") {
-          console.warn(`Gemini finished with reason: ${finishReason}`);
+          throw new Error(`Gemini API Error: Abnormal finish reason - ${finishReason}. Response may be incomplete or filtered.`);
       }
 
       return {
