@@ -13,7 +13,7 @@
  ****************************************************************************************/
 
 const PRODUCT_CONFIG = {
-  VERSION: "v25.1",
+  VERSION: "v25.2",
   COACH_NAME: "Халиунаа",
   PRODUCT_NAME: "Хувийн Жингийн Тайлан",
   SHEET_NAME: "Sheet1",
@@ -297,25 +297,37 @@ function main() {
 
       let isRetry = false;
       if (status === "Боловсруулж байна...") {
-        if (rawDate instanceof Date) {
-          const nowMs = new Date().getTime();
-          const startMs = rawDate.getTime();
-          const diffMinutes = (nowMs - startMs) / (1000 * 60);
+        let diffMinutes = 0;
+        let validDate = false;
 
-          if (diffMinutes > 15) {
-             isRetry = true;
-             console.log(`Timeout recovery for ${name}. Stuck for ${Math.round(diffMinutes)} mins.`);
-          } else {
-             continue;
-          }
+        if (rawDate instanceof Date) {
+            diffMinutes = (new Date().getTime() - rawDate.getTime()) / (1000 * 60);
+            validDate = true;
+        } else if (typeof rawDate === "string" && rawDate.length > 5) {
+            const parsedDate = new Date(rawDate);
+            if (!isNaN(parsedDate.getTime())) {
+                diffMinutes = (new Date().getTime() - parsedDate.getTime()) / (1000 * 60);
+                validDate = true;
+            }
+        }
+
+        if (validDate) {
+            if (diffMinutes > 15) {
+                isRetry = true;
+                console.log(`Timeout recovery for ${name}. Stuck for ${Math.round(diffMinutes)} mins.`);
+            } else {
+                continue; // Still processing, let it be
+            }
         } else {
-           continue;
+            // If date is completely invalid/missing but stuck in Processing, force retry
+            isRetry = true;
         }
       }
 
       statusCell.setValue("Боловсруулж байна...");
 
       const startTime = new Date();
+      // Only set to formatted string to keep sheet clean, logic above now parses it.
       dateCell.setValue(Utilities.formatDate(startTime, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm"));
       SpreadsheetApp.flush();
 
@@ -512,8 +524,17 @@ function generateReport3Parts(userName, metrics, apiKey) {
     // VERY IMPORTANT FIX: Passing the entire previous text causes context pollution and duplicated headings/cut-offs.
     // Instead of passing the massive text back, just give the LLM a short summary of what was already covered.
     let contextSummary = "";
+    const isObese = reportSpec.categoryLabel === "Таргалалттай тайлан";
+    const isUnder = reportSpec.categoryLabel === "Жингийн дутагдалтай тайлан";
+
     if (previousSections.length === 1) {
-        contextSummary = "- Та өмнөх (1-р) хэсэгт бодит байдал, таргалалтын шалтгааныг (Инсулин, Нойр) тайлбарлаж дууссан.";
+        if (isObese) {
+            contextSummary = "- Та өмнөх (1-р) хэсэгт бодит байдал, таргалалтын шалтгааныг (Инсулин, Нойр) тайлбарлаж дууссан.";
+        } else if (isUnder) {
+            contextSummary = "- Та өмнөх (1-р) хэсэгт бодит байдал, жингийн дутагдлын аюулыг тайлбарлаж дууссан.";
+        } else {
+            contextSummary = "- Та өмнөх (1-р) хэсэгт хэвийн болон илүүдэл жингийн далд эрсдэлүүдийг тайлбарлаж дууссан.";
+        }
     } else if (previousSections.length === 2) {
         contextSummary = "- Та өмнөх (2-р) хэсэгт хоолны төлөвлөгөөг (Өглөө, Өдөр, Орой) зааж өгөөд дууссан. Тиймээс ХООЛНЫ ТАЛААР ДАХИЖ ДАВТАХГҮЙ шууд дасгалын хуваарь руу орно.";
     }
@@ -578,7 +599,7 @@ function getReportSpec(metrics) {
     };
   }
 
-  if (metrics.BMI_CATEGORY === "хэвийн жин") {
+  if (metrics.BMI_CATEGORY === "хэвийн жин" || metrics.BMI_CATEGORY === "илүүдэл жин") {
     return {
       templateSet: PRODUCT_CONFIG.PROMPTS.FITNESS_NORMAL,
       requiredHeadings: [
@@ -591,7 +612,7 @@ function getReportSpec(metrics) {
         "Эцсийн үг (Одоо чиний ээлж)"
       ],
       requiredPhrases: sharedPhrases,
-      categoryLabel: "Хэвийн жингийн тайлан"
+      categoryLabel: metrics.BMI_CATEGORY === "илүүдэл жин" ? "Илүүдэл жингийн тайлан (Хөнгөн анхааруулга)" : "Хэвийн жингийн тайлан"
     };
   }
 
@@ -607,7 +628,7 @@ function getReportSpec(metrics) {
       "Эцсийн үг (Одоо чиний ээлж)"
     ],
     requiredPhrases: sharedPhrases,
-    categoryLabel: "Илүүдэл жингийн тайлан"
+    categoryLabel: "Таргалалттай тайлан"
   };
 }
 
@@ -780,8 +801,18 @@ function callGeminiAPI(prompt, apiKey, temp, requireJson = false) {
   const json = JSON.parse(res.getContentText());
 
   if (json.candidates && json.candidates[0].content) {
+      const candidate = json.candidates[0];
+      const finishReason = candidate.finishReason || "";
+
+      if (finishReason === "MAX_TOKENS") {
+          throw new Error("Gemini API Error: MAX_TOKENS reached. The generated text was cut off.");
+      }
+      if (finishReason !== "STOP" && finishReason !== "") {
+          console.warn(`Gemini finished with reason: ${finishReason}`);
+      }
+
       return {
-          text: json.candidates[0].content.parts[0].text,
+          text: candidate.content.parts[0].text,
           usage: json.usageMetadata ? json.usageMetadata.totalTokenCount : 0
       };
   }
