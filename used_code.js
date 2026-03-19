@@ -13,7 +13,7 @@
  ****************************************************************************************/
 
 const PRODUCT_CONFIG = {
-  VERSION: "v25.2",
+  VERSION: "v25.3",
   COACH_NAME: "Халиунаа",
   PRODUCT_NAME: "Хувийн Жингийн Тайлан",
   SHEET_NAME: "Sheet1",
@@ -816,24 +816,45 @@ function callGeminiAPI(prompt, apiKey, temp, requireJson = false) {
       payload.generationConfig.responseMimeType = "application/json";
   }
 
-  const res = UrlFetchApp.fetch(url, { "method": "post", "contentType": "application/json", "payload": JSON.stringify(payload), "muteHttpExceptions": true });
-  const json = JSON.parse(res.getContentText());
+  const maxAttempts = 3;
+  let lastErrorMsg = "";
 
-  if (json.candidates && json.candidates[0].content) {
-      const candidate = json.candidates[0];
-      const finishReason = candidate.finishReason || "";
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const res = UrlFetchApp.fetch(url, { "method": "post", "contentType": "application/json", "payload": JSON.stringify(payload), "muteHttpExceptions": true });
 
-      if (finishReason !== "STOP" && finishReason !== "") {
-          throw new Error(`Gemini API Error: Abnormal finish reason - ${finishReason}. Response may be incomplete or filtered.`);
+      if (res.getResponseCode() === 429 || res.getResponseCode() >= 500) {
+          lastErrorMsg = `HTTP Error: ${res.getResponseCode()} - ${res.getContentText()}`;
+          Utilities.sleep(attempt * 2000); // 2s, then 4s wait
+          continue;
       }
 
-      return {
-          text: candidate.content.parts[0].text,
-          usage: json.usageMetadata ? json.usageMetadata.totalTokenCount : 0
-      };
+      try {
+          const json = JSON.parse(res.getContentText());
+
+          if (json.candidates && json.candidates[0].content) {
+              const candidate = json.candidates[0];
+              const finishReason = candidate.finishReason || "";
+
+              if (finishReason !== "STOP" && finishReason !== "") {
+                  lastErrorMsg = `Abnormal finish reason - ${finishReason}. Response may be incomplete or filtered.`;
+                  // If it's a safety or max tokens issue, retry up to 3 times
+                  Utilities.sleep(attempt * 2000);
+                  continue;
+              }
+
+              return {
+                  text: candidate.content.parts[0].text,
+                  usage: json.usageMetadata ? json.usageMetadata.totalTokenCount : 0
+              };
+          }
+          lastErrorMsg = "No candidates found: " + res.getContentText();
+      } catch (e) {
+          lastErrorMsg = "JSON Parse Error: " + e.toString() + " | " + res.getContentText();
+          Utilities.sleep(attempt * 2000);
+      }
   }
 
-  throw new Error(`Gemini API Error: ${res.getContentText()}`);
+  throw new Error(`Gemini API Error after ${maxAttempts} attempts: ${lastErrorMsg}`);
 }
 
 function fixMongolianName(latinName) {
