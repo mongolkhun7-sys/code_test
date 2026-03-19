@@ -509,25 +509,32 @@ function generateReport3Parts(userName, metrics, apiKey) {
 
   const withPreviousSections = (template, previousSections) => {
     if (!previousSections || previousSections.length === 0) return template;
+    // VERY IMPORTANT FIX: Passing the entire previous text causes context pollution and duplicated headings/cut-offs.
+    // Instead of passing the massive text back, just give the LLM a short summary of what was already covered.
+    let contextSummary = "";
+    if (previousSections.length === 1) {
+        contextSummary = "- Та өмнөх (1-р) хэсэгт бодит байдал, таргалалтын шалтгааныг (Инсулин, Нойр) тайлбарлаж дууссан.";
+    } else if (previousSections.length === 2) {
+        contextSummary = "- Та өмнөх (2-р) хэсэгт хоолны төлөвлөгөөг (Өглөө, Өдөр, Орой) зааж өгөөд дууссан. Тиймээс ХООЛНЫ ТАЛААР ДАХИЖ ДАВТАХГҮЙ шууд дасгалын хуваарь руу орно.";
+    }
+
     return `${template}
 
-VII. ӨМНӨХ ХЭСГҮҮДИЙН КОНТЕКСТ:
-${previousSections.map((section, index) => `--- PART ${index + 1} ---
-${section}`).join("\n\n")}
-
-VIII. ҮРГЭЛЖЛЭЛИЙН ДҮРЭМ:
-- Дээрх хэсгүүдийн өнгө аяс, мэдээлэл, логик урсгалтай зөрчилдөж БОЛОХГҮЙ.
-- Давхардсан оршил, мэндчилгээ, ижил санааг давтаж БОЛОХГҮЙ.
-- Шинэ хэсгээ өмнөхөөсөө байгалийн байдлаар үргэлжлүүл.`;
+VII. ӨМНӨХ ХЭСГҮҮДИЙН КОНТЕКСТ БА ҮРГЭЛЖЛЭЛИЙН ДҮРЭМ:
+${contextSummary}
+- Өмнөх хэсгүүдийн гарчгийг дахин ДАВТАХГҮЙ.
+- Шинэ хэсгээ өмнөхөөсөө байгалийн байдлаар, зөвхөн шинэ мэдээллээр үргэлжлүүл.
+- ХЭЗЭЭ Ч БҮҮ МЭНДЭЛ (Сайн уу гэх мэт).
+- Текстээ бүрэн гүйцэд дуусгахыг хатуу анхаар! (Cut-off хийж болохгүй).`;
   };
 
   const p1 = replaceVars(templateSet.PART_1);
   const r1 = callGeminiAPI(p1, apiKey, PRODUCT_CONFIG.TEMPERATURE);
 
-  const p2 = withPreviousSections(replaceVars(templateSet.PART_2), [r1.text.trim()]);
+  const p2 = withPreviousSections(replaceVars(templateSet.PART_2), [true]); // Use dummy array to indicate part 2
   const r2 = callGeminiAPI(p2, apiKey, PRODUCT_CONFIG.TEMPERATURE);
 
-  const p3 = withPreviousSections(replaceVars(templateSet.PART_3), [r1.text.trim(), r2.text.trim()]);
+  const p3 = withPreviousSections(replaceVars(templateSet.PART_3), [true, true]); // Use dummy array to indicate part 3
   const r3 = callGeminiAPI(p3, apiKey, PRODUCT_CONFIG.TEMPERATURE);
 
   const draftReport = [r1.text.trim(), r2.text.trim(), r3.text.trim()].join("\n\n");
@@ -615,6 +622,9 @@ function sanitizeReportText(text, reportSpec) {
   const cleanedLines = [];
   const rawLines = working.split("\n");
 
+  // Track seen headings to strictly remove duplicates
+  const seenHeadings = new Set();
+
   for (const rawLine of rawLines) {
     const cleanLine = sanitizeReportLine(rawLine, reportSpec);
     if (!cleanLine) {
@@ -623,6 +633,15 @@ function sanitizeReportText(text, reportSpec) {
       }
       continue;
     }
+
+    if (cleanLine.startsWith("[ГАРЧИГ]")) {
+        const headingName = cleanLine.replace("[ГАРЧИГ]", "").trim();
+        if (seenHeadings.has(headingName)) {
+            continue; // Skip duplicate headings entirely
+        }
+        seenHeadings.add(headingName);
+    }
+
     cleanedLines.push(cleanLine);
   }
 
